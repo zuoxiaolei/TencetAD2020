@@ -1,30 +1,34 @@
-import gensim
-import pandas as pd
-from gensim.similarities.index import AnnoyIndexer
-from tqdm import tqdm
-from sklearn.metrics import classification_report
 import logging
-from tqdm import tqdm
+from datetime import datetime
+
+import databricks.koalas as ks
+import gensim
+import joblib
 import numpy as np
+import pandas as pd
 from lightgbm.sklearn import LGBMClassifier
+from pyspark import SparkConf, SparkContext
+from pyspark.sql import SQLContext
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from pyspark.sql import SQLContext
-from pyspark import SparkConf, SparkContext
-from datetime import datetime
-import keras
-from main import PopulationModel
-conf = SparkConf().setAppName("ad_classify").setMaster("local[*]")
+from tqdm import tqdm
+
+logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+conf = SparkConf().setAppName("evaluate tencent ad").setMaster("spark://47.105.217.91:7077").set('spark.driver.memory',
+                                                                                                 '10g').set(
+    'spark.driver.memory', '10g').set("spark.sql.execution.arrow.enabled", "true").set("spark.debug.maxToStringFields",
+                                                                                       "100").set(
+    'spark.executor.memory', '2g')
 sc = SparkContext(conf=conf)
 sql_context = SQLContext(sc)
 
 word2vec_corpus_sql = '''
     select user_id,
-            concat_ws(' ', collect_set(concat_ws('|', creative_id, click_times))) sentence
+            concat_ws(' ', collect_list(creative_id)) sentence
     from click_log
     group by user_id
 '''
+
 
 def get_data(filename='data/train_preliminary/click_log.csv'):
     df_train = sql_context.read.format('com.databricks.spark.csv') \
@@ -45,73 +49,62 @@ def prepare_data():
     corpus.coalesce(1).write.csv("train_date")
     print(datetime.now() - start_time)
 
-logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 
-def evaluate():
-    user_info = pd.read_csv('data/train_preliminary/user.csv')
-    user_sample = user_info.sample(frac=0.2)
+def get_wv_features():
     model = gensim.models.KeyedVectors.load_word2vec_format("data/word2vec.bin", binary=True)
-    print(model[['1', '10']])
-    print(model[['1']])
-    print(model[['10']])
-    # annoy_index = AnnoyIndexer(model, 5)
-    # res = []
-    # for ele in tqdm(user_sample['user_id']):
-    #     select = 1
-    #     for ele in model.most_similar(str(ele), topn=10, indexer=annoy_index)[1:]:
-    #         ele = ele[0]
-    #         if int(ele) <= 900000:
-    #             select = int(ele)
-    #     res.append([select])
-    # res = pd.DataFrame(res, columns=['user_id'])
-    # res = res.merge(user_info, on=["user_id"])
-    # print(classification_report(user_sample['age'].tolist(), res['age'].tolist()))
-    # print(classification_report(user_sample['gender'].tolist(), res['gender'].tolist()))
-
-
-def evaluate1():
-    model = gensim.models.KeyedVectors.load_word2vec_format("data/word2vec.bin", binary=True)
-    user = pd.read_csv('./data/train_preliminary/user.csv')
-    train_corpus = pd.read_csv('train_date/part-00000-4bae5739-ee39-4297-bfbf-6b2ed4a0e3f1-c000.csv', header=None)
+    train_corpus = pd.read_csv('train_date/part-00000-9134d416-d4f5-4998-96ce-8eeed9133a94-c000.csv', header=None)
     train_corpus.columns = ['user_id', 'sentence']
-    user = user.merge(train_corpus, on="user_id")
-    y1 = user.gender-1
-    y2 = user.age-1
-    features = []
-    word2vec_feature = []
-    _, share_model = PopulationModel().build_simple_model()
-    share_model.load_weights('data/share_layer.h5')
-    tmp_features = []
+    user = train_corpus
+    word2vec_features = []
+
+    user_ids = user["user_id"].values
     for ele in tqdm(user.sentence.tolist()):
         words = ele.split(' ')
         tmp = model.wv[words].mean(axis=0)
-        tmp_features.append(tmp)
-        word2vec_feature.append(tmp)
-        if len(tmp_features) >= 256:
-            triple_feature = share_model.predict(np.array(tmp_features), batch_size=len(tmp_features))
-            features.append(triple_feature)
-            tmp_features = []
-    if tmp_features:
-        triple_feature = share_model.predict(np.array(tmp_features), batch_size=len(tmp_features))
-        features.append(triple_feature)
-    features = np.concatenate(features, axis=0)
-    features = np.concatenate([np.array(word2vec_feature), features], axis=1)
-    print(features.shape)
-    X_train, X_test, y_train, y_test = train_test_split(features, y1)
-    lightgbm = LGBMClassifier(n_estimators=200)
-    lightgbm.fit(X_train, y_train,  eval_set=[(X_test, y_test)],
-                 early_stopping_rounds=5)
-    pred = lightgbm.predict(X_test)
-    print(classification_report(y_test, pred))
+        word2vec_features.append(tmp)
+    features = np.array(word2vec_features)
+    features = pd.DataFrame(features)
+    features.columns = ['wv' + str(ele + 1) for ele in range(100)]
+    features.loc[:, "user_id"] = user_ids
+    features.to_csv('./data/wv_features.csv', index=False)
 
-    X_train, X_test, y_train, y_test = train_test_split(features, y2)
-    lightgbm = LGBMClassifier(n_estimators=200)
-    lightgbm.fit(X_train, y_train,  eval_set=[(X_test, y_test)],
+
+def evaluate_age():
+    features = pd.read_csv('data/combine_feature/part-00000-380aaa4b-c838-43f4-8cb7-80164a4256f2-c000.csv')
+    y = features.age.values
+    features.drop(['user_id', 'age', 'gender'], axis=1, inplace=True)
+    print(features.shape)
+    X_train, X_test, y_train, y_test = train_test_split(features, y, test_size=0.2)
+    lightgbm = LGBMClassifier(n_estimators=200,
+                              num_leaves=100,
+                              feature_fraction=0.75,
+                              bagging_fraction=0.75,
+                              learning_rate=0.1
+                              )
+    lightgbm.fit(X_train, y_train, eval_set=[(X_test, y_test)],
                  early_stopping_rounds=5)
     pred = lightgbm.predict(X_test)
     print(classification_report(y_test, pred))
+    joblib.dump(lightgbm, 'data/lgb_age')
+
+
+def combine_feature(train=True):
+    user_filename = 'data/train_preliminary/user.csv' if train else './data/test/click_log.csv'
+    result_filename = './data/combine_feature' if train else './data/combine_feature_test'
+    user_df = ks.read_csv(user_filename)
+    if not train:
+        user_df = ks.sql('select distinct user_id from {user_df}', user_df=user_df)
+    wv_feature = ks.read_csv('data/wv_features.csv')
+    nn_feature = ks.read_csv('data/nn_features.csv')
+    stats_data = ks.read_csv("data/stats_features/part-00000-f6695da4-6d9f-4ba4-80b1-d370e636696b-c000.csv")
+    all_features = user_df.merge(wv_feature, on='user_id').merge(nn_feature, on='user_id').merge(stats_data,
+                                                                                                 on='user_id')
+    print(all_features.shape)
+    all_features.to_csv(result_filename, num_files=1)
+
 
 
 if __name__ == '__main__':
     # prepare_data()
-    evaluate1()
+    # evaluate_age()
+    combine_feature(train=False)

@@ -5,20 +5,16 @@ __time__ = '2020/5/27 22:12'
 __description = ''
 '''
 import csv
-from functools import partial
 import random
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import tensorflow_probability as tfp
-from keras.utils.np_utils import to_categorical
 from keras_preprocessing.sequence import pad_sequences
 from tensorflow import keras
+from tqdm import tqdm
 
 csv.field_size_limit(500 * 1024 * 1024)
-logdir = 'logs/'
-test_logdir = 'test_logs/'
-train_writer = tf.summary.create_file_writer(logdir)
 
 
 def get_ad_dict():
@@ -33,20 +29,29 @@ def get_ad_dict():
     return dict(ad_dict_df.values.tolist())
 
 
-ad_dict = get_ad_dict()
+def train_test_split():
+    train_data_path = './data/train.csv'
+    test_data_path = "./data/test.csv"
+    n = 0
+    with open(train_data_path, 'w', encoding='utf8') as fh_train:
+        with open(test_data_path, 'w', encoding='utf8') as fh_test:
+            with open('data/train_test_corpus/part-00000-92cc7051-a5ec-4f2a-b5cf-9931e1b6e00f-c000.csv', 'r',
+                      encoding='utf8') as fh_train_test:
+                for line in fh_train_test:
+                    n = n + 1
+                    if n > 720000:
+                        fh_test.write(line)
+                    else:
+                        fh_train.write(line)
 
-loss_func = tf.keras.losses.categorical_crossentropy
-optimizer = tf.keras.optimizers.Adam()
-train_loss = tf.keras.metrics.Mean()
-train_metric = tf.keras.metrics.Accuracy(name='train_accuracy')
-valid_loss = tf.keras.metrics.Mean()
-valid_metric = tf.keras.metrics.Accuracy(name='valid_accuracy')
+
+ad_dict = get_ad_dict()
 
 
 class RESEmbedding(keras.Model):
 
-    def __init__(self, embedding_dim=100, mask_zero=True,
-                 hidden_units=128, class_num=10):
+    def __init__(self, embedding_dim=200, mask_zero=True,
+                 hidden_units=768, class_num=10):
         super(RESEmbedding, self).__init__()
 
         self.time_embedding = keras.layers.Embedding(91 + 2, embedding_dim, mask_zero=mask_zero)
@@ -67,9 +72,8 @@ class RESEmbedding(keras.Model):
 
         self.lstm = keras.layers.LSTM(units=hidden_units, return_sequences=False)
         self.dense = keras.layers.Dense(units=class_num, activation='softmax')
-        self.beta = tfp.distributions.beta.Beta(0.2, 0.2)
 
-    def call(self, input_tensors, training=tf.constant(True)):
+    def call(self, input_tensors):
         time_feature = self.time_embedding(input_tensors[0]) * self.time_weight
         click_times_feature = self.click_times_embedding(input_tensors[1]) * self.click_times
         product_id_feature = self.product_id_embedding(input_tensors[2]) * self.product_id
@@ -79,79 +83,118 @@ class RESEmbedding(keras.Model):
         creative_id_feature = self.creative_id_embedding(input_tensors[6]) * self.creative_id
         feature_add = time_feature + click_times_feature + product_id_feature \
                       + product_category_feature + advertiser_id_feature + industry_feature + creative_id_feature
-        if training:
-            prob = self.beta.sample(1)
-            index = tf.random.shuffle(tf.range(feature_add.shape[0]))
-            feature_new = tf.gather(feature_add, index)
-            embedding_feature = prob * feature_add + (1 - prob) * feature_new
-            lstm_feature = self.lstm(embedding_feature)
-            out = self.dense(lstm_feature)
-            return out, index, prob
-
-        else:
-            prob = self.beta.sample(1)
-            index = tf.random.shuffle(tf.range(feature_add.shape[0]))
-            lstm_feature = self.lstm(feature_add)
-            out = self.dense(lstm_feature)
-            return out, index, prob
+        lstm_feature = self.lstm(feature_add)
+        out = self.dense(lstm_feature)
+        return out
 
 
-@tf.function
-def train_step(model, feautes, labels):
-    with tf.GradientTape() as tape:
-        out, index, prob = model(feautes, training=tf.constant(True))
-        mix_labels = tf.gather(labels, index) * prob + (1 - prob) * tf.gather(labels, index)
-        loss = loss_func(mix_labels, out)
-    gradients = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    train_loss.update_state(loss)
-    train_metric.update_state(tf.math.argmax(labels, axis=-1), tf.math.argmax(out, axis=-1))
+class DataGenerator(keras.utils.Sequence):
+    def __init__(self, filename, batch_size=256, user_num=720000, is_age=True):
+        self.batch_size = batch_size
+        self.max_len = 30
+        self.filename = filename
+        self.user_num = user_num
+        self.generate = self.get_batch_sample()
+        self.is_age = is_age
+
+    def __getitem__(self, index):
+        x, y = next(self.generate)
+        return x, y
+
+    def get_feature_index(self, string):
+        return [int(ele) if ele != '\\N' else 0 for ele in string.split(' ')]
+
+    def get_sample(self, filename):
+        while 1:
+            with open(filename, 'r', encoding='utf-8') as fh:
+                lines = csv.DictReader(fh)
+                for line in lines:
+                    time = self.get_feature_index(line['time1'])
+                    click_times = self.get_feature_index(line['click_times'])
+                    creative_id = [ad_dict[ele] for ele in line['creative_id'].split(' ')]
+                    product_id = self.get_feature_index(line['product_id'])
+                    product_category = self.get_feature_index(line['product_category'])
+                    advertiser_id = self.get_feature_index(line['advertiser_id'])
+                    industry = self.get_feature_index(line['industry'])
+                    age = int(line["age"]) - 1
+                    gender = int(line["gender"]) - 1
+                    yield time, click_times, product_id, product_category, advertiser_id, industry, creative_id, age, gender
+
+    def get_batch_sample(self):
+        times = []
+        click_times_list = []
+        product_ids = []
+        product_categorys = []
+        advertiser_ids = []
+        industrys = []
+        creative_ids = []
+        ages = []
+        for time, click_times, product_id, \
+            product_category, advertiser_id, \
+            industry, creative_id, age, gender in self.get_sample(filename=self.filename):
+            times.append(time)
+            click_times_list.append([ele if ele < 96 else 0 for ele in click_times])
+            product_ids.append(product_id)
+            product_categorys.append(product_category)
+            advertiser_ids.append(advertiser_id)
+            industrys.append(industry)
+            creative_ids.append(creative_id)
+            if self.is_age:
+                ages.append(age)
+            else:
+                ages.append(gender)
+            if len(times) >= self.batch_size:
+                maxlen = min([max([len(ele) for ele in times]), 50])
+                yield np.array([pad_sequences(times, maxlen=maxlen),
+                                pad_sequences(click_times_list, maxlen=maxlen),
+                                pad_sequences(product_ids, maxlen=maxlen),
+                                pad_sequences(product_categorys, maxlen=maxlen),
+                                pad_sequences(advertiser_ids, maxlen=maxlen),
+                                pad_sequences(industrys, maxlen=maxlen),
+                                pad_sequences(creative_ids, maxlen=maxlen),
+                                ]), np.array(ages)
+                times = []
+                click_times_list = []
+                product_ids = []
+                product_categorys = []
+                advertiser_ids = []
+                industrys = []
+                creative_ids = []
+                ages = []
+
+    def __len__(self):
+        return int(self.user_num / self.batch_size)
 
 
-@tf.function
-def valid_step(model, features, labels):
-    predictions, index, prob = model(features, training=False)
-    batch_loss = loss_func(labels, predictions)
-    valid_loss.update_state(batch_loss)
-    valid_metric.update_state(tf.math.argmax(labels, axis=-1), tf.math.argmax(predictions, axis=-1))
+def train_model(model_name='gender', is_age=False):
+    class_num = 10 if is_age else 2
+    model = RESEmbedding(class_num=class_num)
+    model.build(input_shape=(8, None, None))
+    model.summary()
+    model.compile(optimizer='adam',
+                  metrics=[keras.metrics.sparse_categorical_accuracy],
+                  loss=keras.losses.sparse_categorical_crossentropy)
 
-
-@tf.function
-def train_model(model, ds_train, ds_valid, epochs, batch_size):
-    for epoch in range(1, epochs + 1):
-        step = tf.constant(1, dtype=tf.int64)
-        for features, labels in ds_train:
-            train_step(model, features, labels)
-            with train_writer.as_default():
-                tf.summary.scalar('loss', train_loss.result(), step=step)
-                tf.summary.scalar('accurary', train_metric.result(), step=step)
-            tf.print(tf.strings.format('Epoch {} Step {}/{} train_loss {} trainaccuracy {}', (epoch, step,
-                                                                                              int(720000 / batch_size),
-                                                                                              train_loss.result(),
-                                                                                              train_metric.result())))
-            step = step + 1
-
-        valid_step_num = tf.constant(1, dtype=tf.int64)
-        for features, labels in ds_valid:
-            valid_step(model, features, labels)
-            with train_writer.as_default():
-                tf.summary.scalar('valid_loss', valid_loss.result(), step=valid_step_num)
-                tf.summary.scalar('valid_accurary', valid_metric.result(), step=valid_step_num)
-            valid_step_num = valid_step_num + 1
-        tf.print(tf.strings.format(' valid_loss {} valid_accuracy {}', (valid_loss.result(),
-                                                                        valid_metric.result())))
-        train_loss.reset_states()
-        valid_loss.reset_states()
-        train_metric.reset_states()
-        valid_metric.reset_states()
+    train_generate = DataGenerator(
+        filename='data/train_test_corpus/part-00000-92cc7051-a5ec-4f2a-b5cf-9931e1b6e00f-c000.csv',
+        user_num=900000,
+        is_age=is_age)
+    test_generate = DataGenerator(filename='./data/test.csv',
+                                  user_num=180000, is_age=is_age)
+    model.fit(x=train_generate,
+              validation_data=test_generate,
+              callbacks=[keras.callbacks.EarlyStopping(patience=2),
+                         keras.callbacks.ModelCheckpoint('{}.h5'.format(model_name))],
+              epochs=1)
+    model.save_weights('final_{}.h5'.format(model_name))
 
 
 def get_feature_index(string):
     return [int(ele) if ele != '\\N' else 0 for ele in string.split(' ')]
 
 
-def get_corpus_generate(filename='',
-                        batch_size=64, training=True, is_age=True):
+def get_predict_corpus(filename='data/predict_corpus/part-00000-34fdfae6-514a-474c-8254-baedcc417c79-c000.csv',
+                       batch_size=1024):
     '''
     :return:
     '''
@@ -163,11 +206,9 @@ def get_corpus_generate(filename='',
     industrys = []
     creative_ids = []
     user_ids = []
-    labels = []
 
-    class_num = 10 if is_age else 2
-
-    with open(filename, 'r', encoding='utf-8') as fh:
+    with open(filename, 'r',
+              encoding='utf-8') as fh:
         lines = csv.DictReader(fh)
         for line in lines:
             time = get_feature_index(line['time1'])
@@ -186,32 +227,16 @@ def get_corpus_generate(filename='',
             advertiser_ids.append(advertiser_id)
             industrys.append(industry)
             creative_ids.append(creative_id)
-            if training:
-                if is_age:
-                    labels.append(int(line['age']) - 1)
-                else:
-                    labels.append(int(line['gender']) - 1)
-
             if len(times) >= batch_size:
                 maxlen = min([max([len(ele) for ele in times]), 50])
-                if training:
-                    yield np.array([pad_sequences(times, maxlen=maxlen),
-                                    pad_sequences(click_times_list, maxlen=maxlen),
-                                    pad_sequences(product_ids, maxlen=maxlen),
-                                    pad_sequences(product_categorys, maxlen=maxlen),
-                                    pad_sequences(advertiser_ids, maxlen=maxlen),
-                                    pad_sequences(industrys, maxlen=maxlen),
-                                    pad_sequences(creative_ids, maxlen=maxlen),
-                                    ]), to_categorical(labels, num_classes=class_num)
-                else:
-                    yield user_ids, np.array([pad_sequences(times, maxlen=maxlen),
-                                              pad_sequences(click_times_list, maxlen=maxlen),
-                                              pad_sequences(product_ids, maxlen=maxlen),
-                                              pad_sequences(product_categorys, maxlen=maxlen),
-                                              pad_sequences(advertiser_ids, maxlen=maxlen),
-                                              pad_sequences(industrys, maxlen=maxlen),
-                                              pad_sequences(creative_ids, maxlen=maxlen),
-                                              ])
+                yield user_ids, np.array([pad_sequences(times, maxlen=maxlen),
+                                          pad_sequences(click_times_list, maxlen=maxlen),
+                                          pad_sequences(product_ids, maxlen=maxlen),
+                                          pad_sequences(product_categorys, maxlen=maxlen),
+                                          pad_sequences(advertiser_ids, maxlen=maxlen),
+                                          pad_sequences(industrys, maxlen=maxlen),
+                                          pad_sequences(creative_ids, maxlen=maxlen),
+                                          ])
                 times = []
                 click_times_list = []
                 product_ids = []
@@ -220,70 +245,67 @@ def get_corpus_generate(filename='',
                 industrys = []
                 creative_ids = []
                 user_ids = []
-                labels = []
-        # if times:
-        #     if training:
-        #         yield np.array([pad_sequences(times, maxlen=maxlen),
-        #                         pad_sequences(click_times_list, maxlen=maxlen),
-        #                         pad_sequences(product_ids, maxlen=maxlen),
-        #                         pad_sequences(product_categorys, maxlen=maxlen),
-        #                         pad_sequences(advertiser_ids, maxlen=maxlen),
-        #                         pad_sequences(industrys, maxlen=maxlen),
-        #                         pad_sequences(creative_ids, maxlen=maxlen),
-        #                         ]), to_categorical(labels, num_classes=class_num)
-        #     else:
-        #         yield user_ids, np.array([pad_sequences(times, maxlen=maxlen),
-        #                                   pad_sequences(click_times_list, maxlen=maxlen),
-        #                                   pad_sequences(product_ids, maxlen=maxlen),
-        #                                   pad_sequences(product_categorys, maxlen=maxlen),
-        #                                   pad_sequences(advertiser_ids, maxlen=maxlen),
-        #                                   pad_sequences(industrys, maxlen=maxlen),
-        #                                   pad_sequences(creative_ids, maxlen=maxlen),
-        #                                   ])
+        if times:
+            yield user_ids, np.array([pad_sequences(times, maxlen=maxlen),
+                                      pad_sequences(click_times_list, maxlen=maxlen),
+                                      pad_sequences(product_ids, maxlen=maxlen),
+                                      pad_sequences(product_categorys, maxlen=maxlen),
+                                      pad_sequences(advertiser_ids, maxlen=maxlen),
+                                      pad_sequences(industrys, maxlen=maxlen),
+                                      pad_sequences(creative_ids, maxlen=maxlen),
+                                      ])
 
 
-# def predict_model():
-#     user_ids = []
-#     predicted_age = []
-#     predicated_gender = []
-#     model = RESEmbedding(class_num=10)
-#     model.build(input_shape=(8, None, None))
-#     model.load_weights('final_age.h5')
-#     for user, feature in tqdm(get_predict_corpus()):
-#         user_ids.extend(user)
-#         predicted_age.extend((np.argmax(model(feature), axis=1) + 1).tolist())
-#     del model
-#     keras.backend.clear_session()
-#
-#     model = RESEmbedding(class_num=2)
-#     model.build(input_shape=(8, None, None))
-#     model.load_weights('final_gender.h5')
-#     for user, feature in tqdm(get_predict_corpus()):
-#         predicated_gender.extend((np.argmax(model(feature), axis=1) + 1).tolist())
-#
-#     result = pd.DataFrame(list(zip(user_ids, predicted_age, predicated_gender)),
-#                           columns=['user_id', 'predicted_age', 'predicted_gender'])
-#     result.to_csv('result.csv', index=False)
+def predict_model():
+    user_ids = []
+    predicted_age = []
+    predicated_gender = []
+    model = RESEmbedding(class_num=10)
+    model.build(input_shape=(8, None, None))
+    model.load_weights('final_age.h5')
+    for user, feature in tqdm(get_predict_corpus()):
+        user_ids.extend(user)
+        predicted_age.extend((np.argmax(model(feature), axis=1) + 1).tolist())
+    del model
+    keras.backend.clear_session()
+
+    model = RESEmbedding(class_num=2)
+    model.build(input_shape=(8, None, None))
+    model.load_weights('final_gender.h5')
+    for user, feature in tqdm(get_predict_corpus()):
+        predicated_gender.extend((np.argmax(model(feature), axis=1) + 1).tolist())
+
+    result = pd.DataFrame(list(zip(user_ids, predicted_age, predicated_gender)),
+                          columns=['user_id', 'predicted_age', 'predicted_gender'])
+    result.to_csv('data/result.csv', index=False)
+
+
+def get_nn_feature(age=True):
+    filename = 'data/train_test_corpus/part-00000-92cc7051-a5ec-4f2a-b5cf-9931e1b6e00f-c000.csv'
+    user_ids, predicted_age = [], []
+    model_filename = 'final_age.h5' if age else 'final_gender.h5'
+    result_filename = './data/nn_features.csv' if age else './data/nn_features_gender.csv'
+    class_num = 10 if age else 2
+    model = RESEmbedding(class_num=class_num)
+    model.build(input_shape=(7, None, None))
+    model.load_weights(model_filename)
+    for user, feature in tqdm(get_predict_corpus(filename)):
+        user_ids.extend(user)
+        predicted_age.extend(model(feature).numpy().tolist())
+
+    for user, feature in tqdm(
+            get_predict_corpus('data/predict_corpus/part-00000-34fdfae6-514a-474c-8254-baedcc417c79-c000.csv')):
+        user_ids.extend(user)
+        predicted_age.extend(model(feature).numpy().tolist())
+    columns = ['nn' + str(ele + 1) for ele in range(class_num)]
+    nn_feature = pd.DataFrame(predicted_age, columns=columns)
+    nn_feature.loc[:, "user_id"] = user_ids
+    nn_feature.to_csv(result_filename, index=False)
 
 
 if __name__ == '__main__':
-    class_num = 10
-    batch_size = 128
-    epoches = 10
-    train_generate = partial(get_corpus_generate, filename='data/train.csv', batch_size=batch_size)
-    test_generate = partial(get_corpus_generate, filename='data/test.csv', batch_size=batch_size)
-    train_dataset = tf.data.Dataset.from_generator(train_generate,
-                                                   output_types=(tf.int32, tf.float32),
-                                                   output_shapes=(tf.TensorShape([7, batch_size, None]),
-                                                                  tf.TensorShape([batch_size, class_num])))
-    valid_dataset = tf.data.Dataset.from_generator(test_generate,
-                                                   output_types=(tf.int32, tf.float32),
-                                                   output_shapes=(
-                                                       tf.TensorShape([7, batch_size, None]),
-                                                       tf.TensorShape([batch_size, class_num]))
-                                                   )
-    model = RESEmbedding(class_num=class_num)
-    model.build(input_shape=(7, 64, None))
-    model.summary()
-    train_model(model, train_dataset, valid_dataset, epoches, batch_size=batch_size)
-    model.save_weights('./data/age.h5')
+    # train_model()
+    # train_model(model_name='age', is_age=True)
+    # predict_model()
+    get_nn_feature()
+    get_nn_feature(age=False)
